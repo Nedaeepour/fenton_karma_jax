@@ -133,7 +133,7 @@ class ResNet(LightningModule):
             self.flow.append(ResidualBlock(n_filters, n_filters, kernel_size=kernel_size, stride=1, padding=padding,
                                            attention=attention, activation=activation))
             
-        self.outlet = nn.Conv3d(n_filters, 1, kernel_size=kernel_size, stride=1, padding=padding)
+        self.outlet = nn.Conv3d(n_filters, self.frames_out, kernel_size=kernel_size, stride=1, padding=padding)
         
     def forward(self, x):
         x = self.inlet(x)
@@ -161,9 +161,11 @@ class ResNet(LightningModule):
         recon_loss = recon_loss * self.loss_weights.get("recon_loss", 1.)
         space_grad_loss = torch.sqrt(space_grad_mse_loss(y_hat, y, reduction="mean")) / y_hat.size(0) / y_hat.size(1)
         space_grad_loss = space_grad_loss * self.loss_weights.get("space_grad_loss", 1.)
+        time_grad_loss = torch.sqrt(time_grad_mse_loss(y_hat, y, reduction="mean")) / y_hat.size(0) / y_hat.size(1)
+        time_grad_loss = time_grad_loss * self.loss_weights.get("space_grad_loss", 1.)
         energy_loss = torch.sqrt(energy_mse_loss(y_hat, y, reduction="mean")) / y_hat.size(0) / y_hat.size(1)
         energy_loss = energy_loss * self.loss_weights.get("energy_loss", 1.)
-        return {"recon_loss": recon_loss, "space_grad_loss": space_grad_loss, "energy_loss": energy_loss}
+        return {"recon_loss": recon_loss, "space_grad_loss": space_grad_loss, "time_grad_loss": time_grad_loss, "energy_loss": energy_loss}
     
     def configure_optimizers(self):
         optimisers = [torch.optim.Adam(self.parameters(), lr=self.lr)]
@@ -184,40 +186,65 @@ class ResNet(LightningModule):
     def training_step(self, batch, batch_idx):
         x = batch[:, :self.frames_in]
         y = batch[:, self.frames_in:]
+        self.profile_gpu_memory()
         
-        output_sequence = torch.empty_like(y, requires_grad=False, device="cpu")
-        loss = {}
-        for i in range(self.frames_out):
-            # forward pass
-            self.profile_gpu_memory()
-            y_hat = self(x).squeeze()
-            self.profile_gpu_memory()
-            
-            # calculate loss
-            current_loss = self.get_loss(y_hat, y[:, i])
-            y_hat = y_hat.detach()
-            total_loss = sum(current_loss.values())
-            for k, v in current_loss.items():
-                loss.update({k: (loss.get(k, 0.) + v)})  # detach partial losses since they're not useful anymore for backprop
-            self.profile_gpu_memory()
-            
-            # backward pass
-            total_loss.backward()
-            self.profile_gpu_memory()
-            
-            # update output sequence
-            output_sequence[:, i] = y_hat
-            self.profile_gpu_memory()
+        # forward pass
+        y_hat = self(x)
+        self.profile_gpu_memory()
 
-            # update input sequence with predicted frames
-            if (self.frames_out > 1):
-                x = torch.stack([x[:, -1], y_hat], dim=1)
-                self.profile_gpu_memory()
-            
+        # calculate loss
+        loss = self.get_loss(y_hat, y)
+        total_loss = sum(loss.values())
+        self.profile_gpu_memory()
+
+        # backward pass
+        total_loss.backward()
+        self.profile_gpu_memory()
+        
         # logging losses
         logs = {"train_loss/" + k: v for k, v in loss.items()}
-        logs["train_loss/total_loss"] = total_loss
-        return {"loss": total_loss, "log": logs, "out": (batch[:, :self.frames_in], output_sequence, y)}
+        logs["train_loss/total_loss"] = total_loss        
+        self.profile_gpu_memory()
+        return {"loss": total_loss, "log": logs, "out": (batch[:, :self.frames_in], y_hat, y)}
+    
+#     def training_step(self, batch, batch_idx):
+#         x = batch[:, :self.frames_in]
+#         y = batch[:, self.frames_in:]
+        
+#         # truncated backprop through time
+#         output_sequence = torch.empty_like(y, requires_grad=False, device="cpu")
+#         loss = {}
+#         for i in range(self.frames_out):
+#             # forward pass
+#             self.profile_gpu_memory()
+#             y_hat = self(x).squeeze()
+#             self.profile_gpu_memory()
+            
+#             # calculate loss
+#             current_loss = self.get_loss(y_hat, y[:, i])
+#             y_hat = y_hat.detach()
+#             total_loss = sum(current_loss.values())
+#             for k, v in current_loss.items():
+#                 loss.update({k: (loss.get(k, 0.) + v)})  # detach partial losses since they're not useful anymore for backprop
+#             self.profile_gpu_memory()
+            
+#             # backward pass
+#             total_loss.backward()
+#             self.profile_gpu_memory()
+            
+#             # update output sequence
+#             output_sequence[:, i] = y_hat
+#             self.profile_gpu_memory()
+
+#             # update input sequence with predicted frames
+#             if (self.frames_out > 1):
+#                 x = torch.stack([x[:, -1], y_hat], dim=1)
+#                 self.profile_gpu_memory()
+            
+#         # logging losses
+#         logs = {"train_loss/" + k: v for k, v in loss.items()}
+#         logs["train_loss/total_loss"] = total_loss
+#         return {"loss": total_loss, "log": logs, "out": (batch[:, :self.frames_in], output_sequence, y)}
     
     def training_step_end(self, outputs):
         # log outputs as images
@@ -237,44 +264,58 @@ class ResNet(LightningModule):
     
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
-        batch = batch.float()
         x = batch[:, :self.frames_in]
         y = batch[:, self.frames_in:]
-        
-        y_hat = torch.empty_like(y)
-        loss = {}
-        for i in range(self.frames_out):
-            # forward model
-            log("memory before forward", torch.cuda.memory_allocated(x.device))
-            y_hat[:, i] = self(x).squeeze()
-            log("memory after forward", torch.cuda.memory_allocated(x.device))
             
-            # calculate loss
-            current_loss = self.get_loss(y_hat[:, i], y[:, i])
-            log("memory after get_loss", torch.cuda.memory_allocated(x.device))
-            total_loss = sum(current_loss.values())
-            log("memory after loss accumulation", torch.cuda.memory_allocated(x.device))
-            for k, v in current_loss.items():
-                loss.update({k: (loss.get(k, 0.) + v)})  # detach partial losses since they're not useful anymore for backprop
-            log("memory after loss dict update", torch.cuda.memory_allocated(x.device))
-            
-            if (self.frames_out > 1):
-                # update sequence
-                x = torch.stack([x[:, -1], y_hat[:, i]], dim=1)
-                log("memory after sequence update", torch.cuda.memory_allocated(x.device))
-            
+        # forward pass
+        y_hat = self(x)
+
+        # calculate loss
+        loss = self.get_loss(y_hat, y)
+        total_loss = sum(loss.values())
+
         # logging losses
         logs = {"val_loss/" + k: v for k, v in loss.items()}
-        logs["val_loss/total_loss"] = total_loss
-        self._val_steps_done += 1
-        return {"loss": total_loss, "log": logs, "out": (batch[:, :self.frames_in], y_hat, y)}
+        logs["val_loss/total_loss"] = total_loss        
+        return {"loss": total_loss, "log": logs, "out": (batch[:, :self.frames_in], y_hat, y)} 
+    
+    
+#     @torch.no_grad()
+#     def __validation_step(self, batch, batch_idx):
+#         x = batch[:, :self.frames_in]
+#         y = batch[:, self.frames_in:]
+        
+#         # truncated backprop through time
+#         output_sequence = torch.empty_like(y, requires_grad=False, device="cpu")
+#         loss = {}
+#         for i in range(self.frames_out):
+#             # forward pass
+#             y_hat = self(x).squeeze()
+            
+#             # calculate loss
+#             current_loss = self.get_loss(y_hat, y[:, i])
+#             total_loss = sum(current_loss.values())
+#             for k, v in current_loss.items():
+#                 loss.update({k: (loss.get(k, 0.) + v)})  # detach partial losses since they're not useful anymore for backprop
+            
+#             # update output sequence
+#             output_sequence[:, i] = y_hat
+
+#             # update input sequence with predicted frames
+#             if (self.frames_out > 1):
+#                 x = torch.stack([x[:, -1], y_hat.unsqueeze(0)], dim=1)
+            
+#         # logging losses
+#         logs = {"val_loss/" + k: v for k, v in loss.items()}
+#         logs["val_loss/total_loss"] = total_loss
+#         return {"loss": total_loss, "log": logs, "out": (batch[:, :self.frames_in], output_sequence, y)}
     
     @torch.no_grad()
     def validation_step_end(self, outputs):
         # log loss
         for k, v in outputs["log"].items():
             self.logger.experiment.add_scalar(k, v, self._val_steps_done)
-        
+            self._val_steps_done += 1
         # log outputs as images
         x, y_hat, y = outputs["out"]
         i = random.randint(0, y_hat.size(0) - 1)
@@ -355,8 +396,8 @@ if __name__ == "__main__":
     loss_weights = {
         "recon_loss": args.recon_loss,
         "space_grad_loss": args.space_grad_loss,
+        "time_grad_loss": args.time_grad_loss,
         "energy_loss": args.energy_loss,
-        "time_grad_loss": args.time_grad_loss
     }
     
     # define model
@@ -376,7 +417,7 @@ if __name__ == "__main__":
     log("parameters: {}".format(model.parameters_count()))
 
     # train_dataloader
-    train_transform = t.Compose([torch.as_tensor, Normalise(), Rotate(), Flip(), Noise(args.frames_in)])
+    train_transform = t.Compose([torch.as_tensor, Normalise(), Rotate(), Flip()])
     train_fkset = FkDataset(args.root, args.frames_in, args.frames_out, args.step, transform=train_transform, squeeze=True, keys=["spiral_params3.hdf5", "three_points_params3.hdf5"])
     train_loader = DataLoader(train_fkset, batch_size=args.batch_size, collate_fn=torch.stack, shuffle=True, num_workers=args.n_workers, pin_memory=True)
     
@@ -393,7 +434,7 @@ if __name__ == "__main__":
                                          log_gpu_memory="all" if args.profile else None,
                                          train_percent_check=0.01 if args.profile else 1.0,
                                          val_percent_check=0.1 if args.profile else 1.0,
-                                         callbacks=[LearningRateLogger(), IncreaseFramsesOut()])
+                                         callbacks=[LearningRateLogger()])
     
     trainer.fit(model, train_dataloader=train_loader, val_dataloaders=val_loader)
     
